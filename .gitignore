@@ -1,0 +1,5 @@
+artifacts/
+bin/
+*.ext4
+vmlinux
+.DS_Store

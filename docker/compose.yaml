@@ -1,0 +1,79 @@
+# Compose topology for fc-live-migration: two Firecracker "hosts" plus
+# a UDP/HTTP observer, all on a fixed-address fcnet bridge network so
+# guest and orchestrator addressing matches internal/api and the
+# beacon wire contract exactly (see fc-contract.md Topology).
+#
+# Build context is the repo root (`..` from this file's directory),
+# matching the Makefile's `images` target.
+services:
+  host-a:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    privileged: true
+    devices:
+      - /dev/kvm
+    networks:
+      fcnet:
+        ipv4_address: 172.30.0.11
+    tmpfs:
+      - /snapshots:size=1g
+    volumes:
+      - ../artifacts:/artifacts:ro
+    ports:
+      - "127.0.0.1:8081:8080"
+    entrypoint: /entrypoint.sh
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 5s
+
+  host-b:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    privileged: true
+    devices:
+      - /dev/kvm
+    networks:
+      fcnet:
+        ipv4_address: 172.30.0.12
+    tmpfs:
+      - /snapshots:size=1g
+    volumes:
+      - ../artifacts:/artifacts:ro
+    ports:
+      - "127.0.0.1:8082:8080"
+    entrypoint: /entrypoint.sh
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 5s
+
+  observer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    # Same image as host-a/host-b, but the observer needs none of the
+    # tap/bridge networking entrypoint.sh performs (and isn't
+    # privileged/kvm-enabled to do it). Overriding `entrypoint:`
+    # (rather than just `command:`) bypasses the image's default
+    # ENTRYPOINT so the container runs only the observer binary.
+    entrypoint: ["/usr/local/bin/observer"]
+    networks:
+      fcnet:
+        ipv4_address: 172.30.0.20
+    ports:
+      - "127.0.0.1:9090:9090"
+
+networks:
+  fcnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          gateway: 172.30.0.1
