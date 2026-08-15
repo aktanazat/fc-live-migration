@@ -171,9 +171,9 @@ func (c *Client) Cutover(ctx context.Context, id string, req api.CutoverRequest)
 
 // Config parameterizes one end-to-end migration run.
 type Config struct {
-	VMID       string
-	SourceURL  string
-	TargetURL  string
+	VMID      string
+	SourceURL string
+	TargetURL string
 	// PeerURL is the target hostd's base URL as reachable from the
 	// source *container* (the source pushes snapshot bytes and issues
 	// the cutover load host-to-host). The orchestrator-visible
@@ -186,6 +186,13 @@ type Config struct {
 	VCPUs      int64
 	MemMiB     int64
 	Tap        api.TapConfig
+
+	// Settle, when non-nil, runs after the guest boots and before the
+	// first pre-copy round. The CLI uses it to wait for the guest
+	// workload to reach steady state (beacon packets flowing) so the
+	// migration exercises a live guest, not one still booting, and to
+	// reset the observer so its report covers only the migration.
+	Settle func(context.Context) error
 
 	// ThresholdBytes stops the pre-copy loop once a diff round's
 	// DataBytes falls at or below this value. Zero selects the
@@ -241,8 +248,7 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// RoundReport records the cost of one pre-copy round (round 0 is the
-// initial full snapshot; rounds 1..N are diffs).
+// RoundReport records the cost of one pre-copy diff round.
 type RoundReport struct {
 	Round     int     `json:"round"`
 	DataBytes int64   `json:"data_bytes"`
@@ -250,29 +256,40 @@ type RoundReport struct {
 	PushMs    float64 `json:"push_ms"`
 }
 
-// MigrationReport is the full timing record of one Orchestrate run.
-type MigrationReport struct {
-	VMID       string              `json:"vm_id"`
-	Rounds     []RoundReport       `json:"rounds"`
-	Cutover    api.CutoverResponse `json:"cutover"`
-	TotalMs    float64             `json:"total_ms"`
-	StartedAt  time.Time           `json:"started_at"`
-	FinishedAt time.Time           `json:"finished_at"`
+// BaseSyncReport records the base checkpoint transfer, which happens
+// while the guest keeps running and so contributes nothing to
+// blackout.
+type BaseSyncReport struct {
+	Bytes int64   `json:"bytes"`
+	Ms    float64 `json:"ms"`
 }
 
-// snapshotWallMs is the total time hostd spent completing a snapshot
-// operation: pause (if needed) + the snapshot write itself + resume
-// (if requested). This is the meaningful per-round cost, distinct
-// from the sub-30ms blackout that only the cutover's final pause
-// incurs.
+// MigrationReport is the full timing record of one Orchestrate run.
+// TotalBlackoutMs sums every window in which the guest was frozen
+// during the migration: each diff round's pause+snapshot+resume plus
+// the cutover blackout. The challenge bar (30ms) applies to this sum.
+type MigrationReport struct {
+	VMID            string              `json:"vm_id"`
+	BaseSync        BaseSyncReport      `json:"base_sync"`
+	Rounds          []RoundReport       `json:"rounds"`
+	Cutover         api.CutoverResponse `json:"cutover"`
+	TotalBlackoutMs float64             `json:"total_blackout_ms"`
+	TotalMs         float64             `json:"total_ms"`
+	StartedAt       time.Time           `json:"started_at"`
+	FinishedAt      time.Time           `json:"finished_at"`
+}
+
+// snapshotWallMs is the window during which the guest is frozen for
+// one snapshot: pause + the snapshot write + resume.
 func snapshotWallMs(s api.SnapshotResponse) float64 {
 	return s.PauseMs + s.SnapMs + s.ResumeMs
 }
 
-// Orchestrate runs the full live-migration algorithm: boot the guest
-// on the source, pre-warm a prepared VM on the target, pre-copy guest
-// memory in a full round followed by shrinking diff rounds, cut over
-// with a sub-30ms blackout, then tear down the source VM.
+// Orchestrate runs the full live-migration algorithm: ensure the
+// guest runs on the source (booting it if absent), pre-warm a
+// prepared VM on the target, ship the source's base checkpoint while
+// the guest keeps running, pre-copy shrinking diff rounds, cut over,
+// then tear down the source VM.
 func Orchestrate(ctx context.Context, cfg Config) (*MigrationReport, error) {
 	cfg.setDefaults()
 	if err := cfg.validate(); err != nil {
@@ -285,58 +302,68 @@ func Orchestrate(ctx context.Context, cfg Config) (*MigrationReport, error) {
 	started := time.Now()
 	report := &MigrationReport{VMID: cfg.VMID, StartedAt: started}
 
-	if _, err := src.CreateVM(ctx, api.CreateVMRequest{
-		ID:              cfg.VMID,
-		KernelPath:      cfg.KernelPath,
-		RootfsPath:      cfg.RootfsPath,
-		KernelArgs:      cfg.KernelArgs,
-		VCPUs:           cfg.VCPUs,
-		MemMiB:          cfg.MemMiB,
-		Tap:             cfg.Tap,
-		TrackDirtyPages: true,
-	}); err != nil {
-		return nil, fmt.Errorf("boot %s on source %s: %w", cfg.VMID, cfg.SourceURL, err)
+	// Reuse a VM already running on the source (the reverse leg of a
+	// previous migration, or one booted out of band); boot otherwise.
+	info, err := src.GetVM(ctx, cfg.VMID)
+	switch {
+	case err == nil && info.State == api.StateRunning:
+		// Migrate the existing guest.
+	case err == nil:
+		return nil, fmt.Errorf("vm %s on source %s is %s, not running", cfg.VMID, cfg.SourceURL, info.State)
+	default:
+		if info, err = src.CreateVM(ctx, api.CreateVMRequest{
+			ID:              cfg.VMID,
+			KernelPath:      cfg.KernelPath,
+			RootfsPath:      cfg.RootfsPath,
+			KernelArgs:      cfg.KernelArgs,
+			VCPUs:           cfg.VCPUs,
+			MemMiB:          cfg.MemMiB,
+			Tap:             cfg.Tap,
+			TrackDirtyPages: true,
+		}); err != nil {
+			return nil, fmt.Errorf("boot %s on source %s: %w", cfg.VMID, cfg.SourceURL, err)
+		}
+	}
+	if info.BaseMemPath == "" || info.BaseStatePath == "" {
+		return nil, fmt.Errorf("vm %s on source %s has no base checkpoint; it cannot be migrated", cfg.VMID, cfg.SourceURL)
 	}
 
 	if _, err := tgt.PrepareVM(ctx, api.PrepareRequest{ID: cfg.VMID, Tap: cfg.Tap}); err != nil {
 		return nil, fmt.Errorf("prepare %s on target %s: %w", cfg.VMID, cfg.TargetURL, err)
 	}
 
+	if cfg.Settle != nil {
+		if err := cfg.Settle(ctx); err != nil {
+			return nil, fmt.Errorf("settle after boot: %w", err)
+		}
+	}
+
 	srcBase := "/snapshots/" + cfg.VMID
 	tgtBase := srcBase + "/base"
 
-	// Round 0: full snapshot, then push both the memory file and the
-	// vmstate file to the target's base directory. The VM keeps
-	// running throughout the push (Resume: true).
-	full, err := src.Snapshot(ctx, cfg.VMID, api.SnapshotRequest{
-		Type:   api.SnapshotFull,
-		Dir:    srcBase + "/r0",
-		Resume: true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("round 0 snapshot: %w", err)
-	}
-	fullPush, err := src.Push(ctx, cfg.VMID, api.PushRequest{TargetURL: cfg.PeerURL, RemoteDir: tgtBase,
+	// Base sync: ship the source's standing base checkpoint (guest
+	// memory as of its last snapshot or load) to the target. The
+	// guest keeps running the whole time, so this contributes zero
+	// blackout no matter how large the base is.
+	baseSync, err := src.Push(ctx, cfg.VMID, api.PushRequest{TargetURL: cfg.PeerURL, RemoteDir: tgtBase,
 		Files: []api.PushFile{
-			{Path: full.MemPath, Name: "mem", Sparse: false},
-			{Path: full.StatePath, Name: "state", Sparse: false},
-		},})
-	if err != nil {
-		return nil, fmt.Errorf("round 0 push: %w", err)
-	}
-	report.Rounds = append(report.Rounds, RoundReport{
-		Round:     0,
-		DataBytes: full.DataBytes,
-		SnapMs:    snapshotWallMs(full),
-		PushMs:    fullPush.Ms,
+			{Path: info.BaseMemPath, Name: "mem", Sparse: true},
+			{Path: info.BaseStatePath, Name: "vmstate", Sparse: false},
+		},
 	})
+	if err != nil {
+		return nil, fmt.Errorf("base sync: %w", err)
+	}
+	report.BaseSync = BaseSyncReport{Bytes: baseSync.BytesSent, Ms: baseSync.Ms}
 
-	// Diff rounds: keep pre-copying while each round's dirtied data
-	// still exceeds the convergence threshold, capped at MaxRounds.
-	// A round whose diff has already converged is not pushed — its
-	// (small) delta is simply absorbed into the cutover's own final
-	// diff, since Firecracker's dirty-page bitmap resets on every
-	// snapshot regardless of whether the result is pushed.
+	// Diff rounds: keep pre-copying until a round's dirtied data
+	// falls to the convergence threshold, capped at MaxRounds.
+	//
+	// Invariant: every diff snapshot taken MUST be pushed. Firecracker
+	// resets the dirty-page bitmap on every snapshot, so an unpushed
+	// diff's pages would appear in neither the base nor any later
+	// diff — the target would silently restore stale memory. The
+	// convergence check therefore runs only AFTER the push.
 	for round := 1; round <= cfg.MaxRounds; round++ {
 		diff, err := src.Snapshot(ctx, cfg.VMID, api.SnapshotRequest{
 			Type:   api.SnapshotDiff,
@@ -346,13 +373,11 @@ func Orchestrate(ctx context.Context, cfg Config) (*MigrationReport, error) {
 		if err != nil {
 			return nil, fmt.Errorf("round %d snapshot: %w", round, err)
 		}
-		if diff.DataBytes <= cfg.ThresholdBytes {
-			break
-		}
 		diffPush, err := src.Push(ctx, cfg.VMID, api.PushRequest{TargetURL: cfg.PeerURL, RemoteDir: tgtBase,
 			Files: []api.PushFile{
 				{Path: diff.MemPath, Name: "mem", Sparse: true},
-			},})
+			},
+		})
 		if err != nil {
 			return nil, fmt.Errorf("round %d push: %w", round, err)
 		}
@@ -362,12 +387,15 @@ func Orchestrate(ctx context.Context, cfg Config) (*MigrationReport, error) {
 			SnapMs:    snapshotWallMs(diff),
 			PushMs:    diffPush.Ms,
 		})
+		if diff.DataBytes <= cfg.ThresholdBytes {
+			break
+		}
 	}
 
-	cutover, err := src.Cutover(ctx, cfg.VMID, api.CutoverRequest{TargetURL: cfg.PeerURL, TargetID:      cfg.VMID,
+	cutover, err := src.Cutover(ctx, cfg.VMID, api.CutoverRequest{TargetURL: cfg.PeerURL, TargetID: cfg.VMID,
 		RemoteDir:     tgtBase,
 		RemoteMemName: "mem",
-		LocalDir:      srcBase + "/cutover",})
+		LocalDir:      srcBase + "/cutover"})
 	if err != nil {
 		return nil, fmt.Errorf("cutover: %w", err)
 	}
@@ -377,6 +405,10 @@ func Orchestrate(ctx context.Context, cfg Config) (*MigrationReport, error) {
 		return nil, fmt.Errorf("delete source vm %s: %w", cfg.VMID, err)
 	}
 
+	for _, rr := range report.Rounds {
+		report.TotalBlackoutMs += rr.SnapMs
+	}
+	report.TotalBlackoutMs += cutover.BlackoutMs
 	finished := time.Now()
 	report.FinishedAt = finished
 	report.TotalMs = float64(finished.Sub(started).Microseconds()) / 1000.0

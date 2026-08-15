@@ -16,13 +16,13 @@ import (
 )
 
 const (
-	defaultKernelArgs  = "console=ttyS0 reboot=k panic=1 pci=off init=/init ip=172.30.0.50::172.30.0.1:255.255.255.0:fcguest:eth0:off"
+	defaultKernelArgs  = "ro console=ttyS0 reboot=k panic=1 pci=off init=/init ip=172.30.0.50::172.30.0.1:255.255.255.0:fcguest:eth0:off"
 	defaultTapName     = "tap0"
 	defaultTapMAC      = "AA:FC:00:00:00:01"
 	defaultVMID        = "vm0"
 	defaultSourceURL   = "http://127.0.0.1:8081"
 	defaultTargetURL   = "http://127.0.0.1:8082"
-	defaultPeerURL     = "http://172.30.0.12:8080"
+	defaultPeerURL     = "http://172.31.0.12:8080"
 	defaultObserverURL = "http://127.0.0.1:9090"
 	defaultKernelPath  = "/artifacts/vmlinux"
 	defaultRootfsPath  = "/artifacts/rootfs.ext4"
@@ -127,6 +127,7 @@ func runMigrate(args []string) error {
 	jsonOut := fs.Bool("json", false, "print the migration report as JSON")
 	observerURL := fs.String("observer", defaultObserverURL, "observer base URL")
 	noObserver := fs.Bool("no-observer", false, "skip the observer reset/report round trip")
+	settleMinPackets := fs.Int64("settle-packets", 500, "beacon packets required before migrating (observer settle)")
 	timeout := fs.Duration("timeout", 2*time.Minute, "overall migration timeout")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -136,10 +137,17 @@ func runMigrate(args []string) error {
 	defer cancel()
 
 	var obsClient *migrate.ObserverClient
+	var settle func(context.Context) error
 	if !*noObserver {
 		obsClient = migrate.NewObserverClient(*observerURL)
 		if err := obsClient.Reset(ctx); err != nil {
 			return fmt.Errorf("observer reset: %w", err)
+		}
+		// Migrate a guest in steady state, not one still booting:
+		// wait for the beacon to flow, then reset the observer so
+		// its report covers exactly the migration window.
+		settle = func(ctx context.Context) error {
+			return obsClient.SettleWait(ctx, *settleMinPackets)
 		}
 	}
 
@@ -156,6 +164,7 @@ func runMigrate(args []string) error {
 		Tap:            api.TapConfig{Name: *tapName, GuestMAC: *tapMAC},
 		ThresholdBytes: *thresholdBytes,
 		MaxRounds:      *maxRounds,
+		Settle:         settle,
 	}
 	report, err := migrate.Orchestrate(ctx, cfg)
 	if err != nil {
@@ -195,11 +204,11 @@ func writeMigrateHuman(w io.Writer, r *migrate.MigrationReport, obs migrate.Obse
 		status = "PASS"
 	}
 	if haveObs {
-		fmt.Fprintf(w, "verdict: %s (<=%.0fms)  blackout_ms=%.3f observer_max_gap_ms=%.3f\n",
-			status, migrate.BlackoutThresholdMs, r.Cutover.BlackoutMs, obs.MaxGapMs)
+		fmt.Fprintf(w, "verdict: %s (<=%.0fms)  total_blackout_ms=%.3f cutover_blackout_ms=%.3f observer_max_gap_ms=%.3f\n",
+			status, migrate.BlackoutThresholdMs, r.TotalBlackoutMs, r.Cutover.BlackoutMs, obs.MaxGapMs)
 	} else {
-		fmt.Fprintf(w, "verdict: %s (<=%.0fms)  blackout_ms=%.3f (observer skipped)\n",
-			status, migrate.BlackoutThresholdMs, r.Cutover.BlackoutMs)
+		fmt.Fprintf(w, "verdict: %s (<=%.0fms)  total_blackout_ms=%.3f cutover_blackout_ms=%.3f (observer skipped)\n",
+			status, migrate.BlackoutThresholdMs, r.TotalBlackoutMs, r.Cutover.BlackoutMs)
 	}
 }
 
@@ -220,8 +229,11 @@ func writeMigrateJSON(w io.Writer, r *migrate.MigrationReport, obs migrate.Obser
 	return enc.Encode(out)
 }
 
+// migratePass applies the challenge bar to the strictest available
+// numbers: the summed guest-frozen time on the source clock, and the
+// worst beacon inter-arrival gap the observer saw on the wire.
 func migratePass(r *migrate.MigrationReport, obs migrate.ObserverReport, haveObs bool) bool {
-	pass := migrate.Passes(r.Cutover.BlackoutMs)
+	pass := migrate.Passes(r.TotalBlackoutMs)
 	if haveObs {
 		pass = pass && migrate.Passes(obs.MaxGapMs)
 	}
@@ -236,8 +248,8 @@ func printResultLine(w io.Writer, r *migrate.MigrationReport, obs migrate.Observ
 	if haveObs {
 		maxGap = obs.MaxGapMs
 	}
-	fmt.Fprintf(w, "RESULT blackout_ms=%.3f extents=%d diff_bytes=%d max_gap_ms=%.3f pass=%t\n",
-		r.Cutover.BlackoutMs, r.Cutover.Extents, r.Cutover.DiffBytes, maxGap, migratePass(r, obs, haveObs))
+	fmt.Fprintf(w, "RESULT total_blackout_ms=%.3f cutover_blackout_ms=%.3f extents=%d diff_bytes=%d max_gap_ms=%.3f pass=%t\n",
+		r.TotalBlackoutMs, r.Cutover.BlackoutMs, r.Cutover.Extents, r.Cutover.DiffBytes, maxGap, migratePass(r, obs, haveObs))
 }
 
 func runStatus(args []string) error {
@@ -295,12 +307,14 @@ func runReport(args []string) error {
 		return enc.Encode(rep)
 	}
 
-	fmt.Printf("packets=%d max_gap_ms=%.3f last_seq=%d started_at=%s\n",
-		rep.Packets, rep.MaxGapMs, rep.LastSeq, rep.StartedAt.Format(time.RFC3339))
-	if len(rep.Gaps) > 0 {
+	fmt.Printf("packets=%d max_gap_ms=%.3f last_seq=%d since=%s\n",
+		rep.Packets, rep.MaxGapMs, rep.LastSeq,
+		time.UnixMilli(rep.SinceUnixMs).Format(time.RFC3339))
+	if len(rep.TopGaps) > 0 {
 		fmt.Println("top gaps:")
-		for _, g := range rep.Gaps {
-			fmt.Printf("  seq=%d gap_ms=%.3f at=%s\n", g.Seq, g.GapMs, g.At.Format(time.RFC3339Nano))
+		for _, g := range rep.TopGaps {
+			fmt.Printf("  seq=%d gap_ms=%.3f at=%s\n", g.Seq, g.GapMs,
+				time.UnixMilli(g.AtUnixMs).Format(time.RFC3339Nano))
 		}
 	}
 	return nil

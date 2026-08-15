@@ -17,6 +17,7 @@ cd "$REPO_ROOT"
 HOSTD_A="http://127.0.0.1:8081"
 HOSTD_B="http://127.0.0.1:8082"
 OBSERVER="http://127.0.0.1:9090"
+PEER_A="http://172.31.0.11:8080"
 SMOKE_ID="smoke0"
 BUDGET_MS="30"
 MIGRATECTL="bin/migratectl"
@@ -24,7 +25,7 @@ BEACON_WAIT_ITERS="60"
 BEACON_WAIT_SLEEP="0.25"
 
 step() {
-	printf '\n[%s] %d/5  %s\n' "$(date +%H:%M:%S)" "$1" "$2"
+	printf '\n[%s] %d/6  %s\n' "$(date +%H:%M:%S)" "$1" "$2"
 }
 
 # Polls the observer's packet count until it is nonzero. Prints the
@@ -54,7 +55,7 @@ echo "observer stats cleared"
 
 step 2 "smoke-testing host-a: boot, confirm beacon, tear down"
 "$MIGRATECTL" boot --host "$HOSTD_A" --vm "$SMOKE_ID" \
-	--kernel artifacts/vmlinux --rootfs artifacts/rootfs.ext4 \
+	--kernel /artifacts/vmlinux --rootfs /artifacts/rootfs.ext4 \
 	--vcpus 1 --mem-mib 128
 if packets="$(wait_for_beacon)"; then
 	echo "beacon alive: $packets packets received from $SMOKE_ID"
@@ -74,7 +75,7 @@ if [[ -z "$result_line" ]]; then
 	echo "FAIL: no RESULT line in migratectl output" >&2
 	exit 1
 fi
-blackout_ms="$(printf '%s' "$result_line" | sed -n 's/.*blackout_ms=\([0-9.]*\).*/\1/p')"
+blackout_ms="$(printf '%s' "$result_line" | sed -n 's/.*total_blackout_ms=\([0-9.]*\).*/\1/p')"
 result_max_gap_ms="$(printf '%s' "$result_line" | sed -n 's/.*max_gap_ms=\(-\?[0-9.]*\).*/\1/p')"
 result_pass="$(printf '%s' "$result_line" | sed -n 's/.*pass=\(true\|false\).*/\1/p')"
 
@@ -95,5 +96,16 @@ if [[ "$pass" -eq 1 ]]; then
 	echo "PASS: vm0 migrated host-a -> host-b within the ${BUDGET_MS}ms blackout budget"
 else
 	echo "FAIL: blackout exceeded ${BUDGET_MS}ms (migratectl verdict or observer gap)"
+	exit 1
+fi
+
+step 6 "migrating the same running guest back host-b -> host-a"
+reverse_out="$("$MIGRATECTL" migrate --source "$HOSTD_B" --target "$HOSTD_A" --peer "$PEER_A" 2>&1 | tee /dev/stderr)"
+reverse_line="$(printf '%s\n' "$reverse_out" | grep '^RESULT ' | tail -n1)"
+reverse_pass="$(printf '%s' "$reverse_line" | sed -n 's/.*pass=\(true\|false\).*/\1/p')"
+if [[ "$reverse_pass" == "true" ]]; then
+	echo "PASS: round trip complete; the guest never stopped serving"
+else
+	echo "FAIL: reverse migration exceeded the blackout budget" >&2
 	exit 1
 fi

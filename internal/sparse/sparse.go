@@ -107,6 +107,53 @@ func ApplyExtents(r io.Reader, f *os.File) (int64, []Extent, error) {
 	return total, extents, nil
 }
 
+// Merge copies every allocated extent of the sparse file at srcPath
+// into dstPath at the same offsets, then grows dstPath to at least
+// srcPath's apparent size. This is the local equivalent of
+// StreamExtents piped into ApplyExtents: applying a diff snapshot
+// onto a base memory file.
+func Merge(dstPath, srcPath string) (int64, int, error) {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return 0, 0, fmt.Errorf("open %s: %w", srcPath, err)
+	}
+	defer src.Close()
+
+	dst, err := os.OpenFile(dstPath, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		return 0, 0, fmt.Errorf("open %s: %w", dstPath, err)
+	}
+	defer dst.Close()
+
+	extents, err := WalkExtents(src)
+	if err != nil {
+		return 0, 0, err
+	}
+	var total int64
+	for _, e := range extents {
+		n, err := io.Copy(io.NewOffsetWriter(dst, e.Off), io.NewSectionReader(src, e.Off, e.Len))
+		total += n
+		if err != nil {
+			return total, len(extents), fmt.Errorf("merge extent (off %d len %d) into %s: %w", e.Off, e.Len, dstPath, err)
+		}
+	}
+
+	srcInfo, err := src.Stat()
+	if err != nil {
+		return total, len(extents), fmt.Errorf("stat %s: %w", srcPath, err)
+	}
+	dstInfo, err := dst.Stat()
+	if err != nil {
+		return total, len(extents), fmt.Errorf("stat %s: %w", dstPath, err)
+	}
+	if dstInfo.Size() < srcInfo.Size() {
+		if err := dst.Truncate(srcInfo.Size()); err != nil {
+			return total, len(extents), fmt.Errorf("truncate %s to %d: %w", dstPath, srcInfo.Size(), err)
+		}
+	}
+	return total, len(extents), nil
+}
+
 // AllocatedBytes returns the number of bytes actually allocated to
 // the file at path — its on-disk (non-hole) footprint — rather than
 // its apparent size.

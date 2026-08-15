@@ -8,8 +8,10 @@ package hostd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -107,6 +109,37 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 
 func msSince(start time.Time) float64 {
 	return float64(time.Since(start)) / float64(time.Millisecond)
+}
+
+// copyFile atomically replaces dst with a copy of src: written to a
+// sibling temp file first, then renamed into place, so a concurrent
+// reader never sees a torn file.
+func copyFile(dst, src string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", src, err)
+	}
+	defer in.Close()
+
+	tmp := dst + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", tmp, err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("copy %s to %s: %w", src, tmp, err)
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("close %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("rename %s to %s: %w", tmp, dst, err)
+	}
+	return nil
 }
 
 func decodeJSON(r *http.Request, v any) error {

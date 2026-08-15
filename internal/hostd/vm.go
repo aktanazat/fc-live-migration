@@ -23,13 +23,27 @@ type VM struct {
 	SockPath        string
 	LogPath         string
 	FC              *fc.Client
+
+	// BaseMemPath/BaseStatePath implement the base checkpoint
+	// invariant documented on api.VMInfo: BaseMemPath equals guest
+	// memory as of the last snapshot or load, and every diff snapshot
+	// is merged into it. Empty when the VM cannot be migrated (dirty
+	// page tracking disabled).
+	BaseMemPath   string
+	BaseStatePath string
 }
 
 // Info snapshots the VM's current identity fields into the wire
 // type. Callers must hold vm.mu (or otherwise know no concurrent
 // state transition is in flight) for a consistent read of State.
 func (vm *VM) Info() api.VMInfo {
-	return api.VMInfo{ID: vm.ID, State: vm.State, PID: vm.FC.PID()}
+	return api.VMInfo{
+		ID:            vm.ID,
+		State:         vm.State,
+		PID:           vm.FC.PID(),
+		BaseMemPath:   vm.BaseMemPath,
+		BaseStatePath: vm.BaseStatePath,
+	}
 }
 
 // registry is the set of VMs this hostd knows about, keyed by id.

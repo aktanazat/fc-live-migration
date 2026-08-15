@@ -66,7 +66,46 @@ func (s *Server) handleCreateVM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, fmt.Errorf("vm %s already exists", req.ID))
 		return
 	}
+
+	// Establish the base checkpoint invariant (see api.VMInfo): a
+	// full snapshot taken at provisioning time, before any workload
+	// exists, so no later migration ever needs a pause proportional
+	// to full guest memory. The snapshot resets the dirty-page
+	// bitmap, so the bitmap tracks exactly the writes after this
+	// base.
+	if req.TrackDirtyPages {
+		baseDir := filepath.Join(dir, "base")
+		if err := s.takeBaseSnapshot(vm, baseDir); err != nil {
+			_ = client.Kill()
+			s.reg.remove(req.ID)
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("provisioning base snapshot: %w", err))
+			return
+		}
+	}
 	writeJSON(w, http.StatusCreated, vm.Info())
+}
+
+// takeBaseSnapshot pauses vm, writes a full snapshot into baseDir,
+// resumes, and records the base paths. Called at provisioning time
+// while the caller still owns the VM exclusively.
+func (s *Server) takeBaseSnapshot(vm *VM, baseDir string) error {
+	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", baseDir, err)
+	}
+	memPath := filepath.Join(baseDir, snapshotMemName)
+	statePath := filepath.Join(baseDir, snapshotStateName)
+	if err := vm.FC.Pause(); err != nil {
+		return fmt.Errorf("pause: %w", err)
+	}
+	if err := vm.FC.CreateSnapshot(fc.SnapshotFull, statePath, memPath); err != nil {
+		return fmt.Errorf("create full snapshot: %w", err)
+	}
+	if err := vm.FC.Resume(); err != nil {
+		return fmt.Errorf("resume: %w", err)
+	}
+	vm.BaseMemPath = memPath
+	vm.BaseStatePath = statePath
+	return nil
 }
 
 func validateCreateVMRequest(req api.CreateVMRequest) error {
@@ -294,6 +333,23 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		vm.State = api.StateRunning
 	}
 
+	// Maintain the base checkpoint invariant: every diff snapshot's
+	// dirty pages fold into the local base, keeping BaseMemPath equal
+	// to guest memory as of this snapshot. Runs after the resume so
+	// the merge cost never extends the guest's frozen window. The
+	// base dir itself is exempt (the provisioning snapshot writes
+	// there directly).
+	if snapType == fc.SnapshotDiff && vm.BaseMemPath != "" && memPath != vm.BaseMemPath {
+		if _, _, err := sparse.Merge(vm.BaseMemPath, memPath); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("merge diff into base: %w", err))
+			return
+		}
+		if err := copyFile(vm.BaseStatePath, statePath); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("refresh base vmstate: %w", err))
+			return
+		}
+	}
+
 	memInfo, err := os.Stat(memPath)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("stat %s: %w", memPath, err))
@@ -360,6 +416,8 @@ func (s *Server) handleLoad(w http.ResponseWriter, r *http.Request) {
 	ms := msSince(start)
 
 	vm.TrackDirtyPages = req.TrackDirtyPages
+	vm.BaseMemPath = req.MemPath
+	vm.BaseStatePath = req.StatePath
 	if req.Resume {
 		vm.State = api.StateRunning
 	} else {

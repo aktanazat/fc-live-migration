@@ -16,6 +16,8 @@ services:
     networks:
       fcnet:
         ipv4_address: 172.30.0.11
+      mignet:
+        ipv4_address: 172.31.0.11
     tmpfs:
       - /snapshots:size=1g
     volumes:
@@ -40,6 +42,8 @@ services:
     networks:
       fcnet:
         ipv4_address: 172.30.0.12
+      mignet:
+        ipv4_address: 172.31.0.12
     tmpfs:
       - /snapshots:size=1g
     volumes:
@@ -77,3 +81,13 @@ networks:
       config:
         - subnet: 172.30.0.0/24
           gateway: 172.30.0.1
+  # Dedicated migration network. Snapshot pushes and the cutover load
+  # travel here so bulk memory transfer never queues ahead of the
+  # guest's own traffic on fcnet (the same reason production
+  # hypervisors give live migration its own NIC).
+  mignet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+          gateway: 172.31.0.1

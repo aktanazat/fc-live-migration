@@ -27,14 +27,12 @@ func (r *MigrationReport) WriteHuman(w io.Writer) {
 	fmt.Fprintf(w, "migration report: vm=%s started=%s finished=%s total_ms=%.3f\n",
 		r.VMID, r.StartedAt.Format(time.RFC3339), r.FinishedAt.Format(time.RFC3339), r.TotalMs)
 
+	fmt.Fprintf(w, "base sync: %d B in %.3fms (guest running, zero blackout)\n",
+		r.BaseSync.Bytes, r.BaseSync.Ms)
 	fmt.Fprintln(w, "rounds:")
 	for _, rr := range r.Rounds {
-		kind := "diff"
-		if rr.Round == 0 {
-			kind = "full"
-		}
-		fmt.Fprintf(w, "  round %-2d %-4s  data=%12d B  snap=%9.3fms  push=%9.3fms\n",
-			rr.Round, kind, rr.DataBytes, rr.SnapMs, rr.PushMs)
+		fmt.Fprintf(w, "  round %-2d diff  data=%12d B  snap=%9.3fms  push=%9.3fms\n",
+			rr.Round, rr.DataBytes, rr.SnapMs, rr.PushMs)
 	}
 
 	fmt.Fprintln(w, "cutover:")
@@ -45,6 +43,7 @@ func (r *MigrationReport) WriteHuman(w io.Writer) {
 	fmt.Fprintf(w, "  %-10s %10.3f\n", "load", r.Cutover.LoadMs)
 	fmt.Fprintf(w, "  %-10s %10.3f\n", "blackout", r.Cutover.BlackoutMs)
 	fmt.Fprintf(w, "  diff_bytes=%d extents=%d\n", r.Cutover.DiffBytes, r.Cutover.Extents)
+	fmt.Fprintf(w, "total blackout: %.3fms (diff-round pauses + cutover)\n", r.TotalBlackoutMs)
 }
 
 // WriteJSON renders the report as indented JSON.
@@ -56,19 +55,44 @@ func (r *MigrationReport) WriteJSON(w io.Writer) error {
 
 // GapEntry is one inter-arrival gap recorded by the observer.
 type GapEntry struct {
-	Seq   uint64    `json:"seq"`
-	GapMs float64   `json:"gap_ms"`
-	At    time.Time `json:"at"`
+	Seq      uint64  `json:"seq"`
+	GapMs    float64 `json:"gap_ms"`
+	AtUnixMs int64   `json:"at_unix_ms"`
 }
 
 // ObserverReport is the observer's /report payload: beacon packet
 // arrival statistics over the current measurement window.
 type ObserverReport struct {
-	Packets   int64      `json:"packets"`
-	MaxGapMs  float64    `json:"max_gap_ms"`
-	Gaps      []GapEntry `json:"gaps"`
-	LastSeq   uint64     `json:"last_seq"`
-	StartedAt time.Time  `json:"started_at"`
+	Packets     int64      `json:"packets"`
+	MaxGapMs    float64    `json:"max_gap_ms"`
+	TopGaps     []GapEntry `json:"top_gaps"`
+	LastSeq     uint64     `json:"last_seq"`
+	SinceUnixMs int64      `json:"since_unix_ms"`
+}
+
+// SettleWait polls the observer until the guest's beacon reaches
+// steady state: at least minPackets received and the packet count
+// still advancing between polls. It then resets the observer so the
+// next Report covers only the migration window.
+func (c *ObserverClient) SettleWait(ctx context.Context, minPackets int64) error {
+	var prev int64 = -1
+	tick := time.NewTicker(200 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for beacon steady state: %w", ctx.Err())
+		case <-tick.C:
+		}
+		rep, err := c.Report(ctx)
+		if err != nil {
+			return fmt.Errorf("observer report during settle: %w", err)
+		}
+		if rep.Packets >= minPackets && rep.Packets > prev && prev >= 0 {
+			return c.Reset(ctx)
+		}
+		prev = rep.Packets
+	}
 }
 
 // ObserverClient is a typed wrapper over the observer's small HTTP

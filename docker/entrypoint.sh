@@ -9,7 +9,16 @@
 # Runs once at container start, then execs hostd as PID 1.
 set -eu
 
-iface_eth0="eth0"
+# The container sits on two Docker networks: fcnet (guest traffic,
+# 172.30.0.0/24) and mignet (bulk migration transfer, 172.31.0.0/24).
+# Only the fcnet interface is bridged with the guest tap; interface
+# names are assigned by Docker in network-name order, so find the
+# fcnet one by its address instead of assuming eth0.
+iface_eth0="$(ip -4 -o addr show | awk '$4 ~ /^172\.30\.0\./ {print $2; exit}')"
+if [ -z "${iface_eth0}" ]; then
+	echo "entrypoint: no interface with a 172.30.0.0/24 address found" >&2
+	exit 1
+fi
 iface_tap0="tap0"
 bridge="br0"
 # Fallback default gateway if the route capture below (unexpectedly)

@@ -15,11 +15,14 @@
 //	POST   /vms/{id}/load              LoadRequest      → OpTiming     (snapshot/load into a prepared VM)
 //	POST   /vms/{id}/cutover           CutoverRequest   → CutoverResponse (source-side final phase)
 //	POST   /files/base?dir=&name=      octet-stream     → FileWriteResponse (receive a whole file)
-//	POST   /files/extents?dir=&name=   extent stream    → FileWriteResponse (apply sparse extents in place)
+//	POST   /files/extents?dir=&name=&size=  extent stream → FileWriteResponse (apply sparse extents in place)
 //
 // Extent wire format (POST /files/extents body): repeated frames of
 // [offset uint64 LE][length uint64 LE][length bytes of data] until EOF.
-// The receiver pwrites each frame at its offset into the named file.
+// The receiver pwrites each frame at its offset into the named file,
+// then truncates it to `size` (the sender's apparent file size) so
+// trailing holes survive the transfer and the result is a
+// byte-identical sparse replica.
 package api
 
 // VMState is the lifecycle state of a microVM as reported by hostd.
@@ -72,10 +75,21 @@ type PrepareRequest struct {
 }
 
 // VMInfo reports a microVM known to hostd.
+//
+// Base checkpoint invariant: for every VM hostd can migrate,
+// BaseMemPath names a local file equal to guest memory as of the last
+// snapshot or load, and the dirty-page bitmap tracks writes since
+// then. A freshly booted VM gets a full snapshot at provisioning
+// time; a restored VM's base is the memory file it was loaded from;
+// every subsequent diff snapshot is merged into the base. Migration
+// therefore ships the base while the guest keeps running, and only
+// diff rounds and the cutover pause the guest.
 type VMInfo struct {
-	ID    string  `json:"id"`
-	State VMState `json:"state"`
-	PID   int     `json:"pid,omitempty"`
+	ID            string  `json:"id"`
+	State         VMState `json:"state"`
+	PID           int     `json:"pid,omitempty"`
+	BaseMemPath   string  `json:"base_mem_path,omitempty"`
+	BaseStatePath string  `json:"base_state_path,omitempty"`
 }
 
 // OpTiming reports how long a single operation took.

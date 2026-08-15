@@ -12,6 +12,7 @@ import (
 
 	"github.com/aktanazat/fc-live-migration/internal/api"
 	"github.com/aktanazat/fc-live-migration/internal/fc"
+	"github.com/aktanazat/fc-live-migration/internal/sparse"
 )
 
 // handleCutover runs the final migration phase entirely on the
@@ -75,7 +76,7 @@ func (s *Server) handleCutover(w http.ResponseWriter, r *http.Request) {
 
 	snapStart := time.Now()
 	if err := vm.FC.CreateSnapshot(fc.SnapshotDiff, statePath, memPath); err != nil {
-		s.cutoverRollback(vm, fmt.Errorf("diff snapshot: %w", err), w)
+		s.cutoverRollback(vm, "", fmt.Errorf("diff snapshot: %w", err), w)
 		return
 	}
 	snapMs := msSince(snapStart)
@@ -83,14 +84,14 @@ func (s *Server) handleCutover(w http.ResponseWriter, r *http.Request) {
 	pushStart := time.Now()
 	diffBytes, extentCount, err := s.pushCutoverFiles(r.Context(), extentsURL, stateURL, memPath, statePath)
 	if err != nil {
-		s.cutoverRollback(vm, fmt.Errorf("push cutover files: %w", err), w)
+		s.cutoverRollback(vm, memPath, fmt.Errorf("push cutover files: %w", err), w)
 		return
 	}
 	pushMs := msSince(pushStart)
 
 	loadStart := time.Now()
 	if err := s.remoteLoad(r.Context(), loadURL, loadReq); err != nil {
-		s.cutoverRollback(vm, fmt.Errorf("remote load: %w", err), w)
+		s.cutoverRollback(vm, memPath, fmt.Errorf("remote load: %w", err), w)
 		return
 	}
 	loadMs := msSince(loadStart)
@@ -109,15 +110,23 @@ func (s *Server) handleCutover(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// cutoverRollback best-effort resumes the source VM after a failed
-// cutover step, so a transient peer failure doesn't strand the guest
-// paused forever, then writes the error response. vm.mu is already
-// held by the caller.
-func (s *Server) cutoverRollback(vm *VM, cause error, w http.ResponseWriter) {
+// cutoverRollback best-effort recovers the source VM after a failed
+// cutover step: resume the guest so a transient peer failure doesn't
+// strand it paused, then fold the already-taken final diff into the
+// local base (the dirty bitmap reset when that diff was written, so
+// skipping the merge would lose those pages from any retried
+// migration). vm.mu is already held by the caller.
+func (s *Server) cutoverRollback(vm *VM, diffMemPath string, cause error, w http.ResponseWriter) {
 	if err := vm.FC.Resume(); err != nil {
 		s.logger.Error("cutover rollback resume failed", "vm", vm.ID, "err", err)
 	} else {
 		vm.State = api.StateRunning
+	}
+	if diffMemPath != "" && vm.BaseMemPath != "" {
+		if _, _, err := sparse.Merge(vm.BaseMemPath, diffMemPath); err != nil {
+			s.logger.Error("cutover rollback base merge failed; local base is stale",
+				"vm", vm.ID, "diff", diffMemPath, "err", err)
+		}
 	}
 	writeError(w, http.StatusInternalServerError, cause)
 }

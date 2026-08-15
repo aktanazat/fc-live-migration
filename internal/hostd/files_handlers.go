@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/aktanazat/fc-live-migration/internal/api"
@@ -84,6 +85,20 @@ func (s *Server) handleFilesExtents(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("apply extents to %s: %w", path, err))
 		return
+	}
+	// A base transfer built from a diff-since-boot snapshot arrives
+	// sparse: pages the guest never wrote are holes. Grow the file to
+	// the full guest-memory size so Firecracker accepts it on load.
+	if sizeStr := r.URL.Query().Get("size"); sizeStr != "" {
+		size, perr := strconv.ParseInt(sizeStr, 10, 64)
+		if perr != nil || size <= 0 {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid size %q", sizeStr))
+			return
+		}
+		if err := f.Truncate(size); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("truncate %s to %d: %w", path, size, err))
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, api.FileWriteResponse{BytesWritten: n, Extents: len(extents)})
 }

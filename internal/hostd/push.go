@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/aktanazat/fc-live-migration/internal/api"
@@ -50,10 +52,19 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 }
 
 // pushOne sends one PushFile to the peer, choosing the sparse
-// extents endpoint or the whole-file endpoint per pf.Sparse.
+// extents endpoint or the whole-file endpoint per pf.Sparse. Sparse
+// pushes carry the file's apparent size so the receiver can extend
+// its copy over any trailing hole and end up with a byte-identical
+// replica.
 func (s *Server) pushOne(ctx context.Context, targetURL, remoteDir string, pf api.PushFile) (int64, int, error) {
 	if pf.Sparse {
-		return s.postExtents(ctx, filesExtentsURL(targetURL, remoteDir, pf.Name), pf.Path)
+		info, err := os.Stat(pf.Path)
+		if err != nil {
+			return 0, 0, fmt.Errorf("stat %s: %w", pf.Path, err)
+		}
+		u := filesExtentsURL(targetURL, remoteDir, pf.Name) +
+			"&size=" + strconv.FormatInt(info.Size(), 10)
+		return s.postExtents(ctx, u, pf.Path)
 	}
 	n, err := s.postFile(ctx, filesBaseURL(targetURL, remoteDir, pf.Name), pf.Path)
 	return n, 0, err

@@ -171,7 +171,10 @@ func (c *Client) ConfigureAndBoot(cfg BootConfig) error {
 		DriveID:      "rootfs",
 		PathOnHost:   cfg.RootfsPath,
 		IsRootDevice: true,
-		IsReadOnly:   false,
+		// The rootfs is shared storage: both hosts see the identical
+		// file at the identical path, so the drive must be read-only
+		// (the live-migration model migrates RAM, not disks).
+		IsReadOnly: true,
 	}); err != nil {
 		return fmt.Errorf("drives/rootfs: %w", err)
 	}
