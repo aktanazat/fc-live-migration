@@ -1,0 +1,27 @@
+# Lima VM for Firecracker development on Apple Silicon.
+# Requires macOS 15+ and an M3-or-newer chip: nested virtualization
+# exposes /dev/kvm inside the guest so Firecracker can run.
+vmType: "vz"
+nestedVirtualization: true
+
+cpus: 8
+memory: "10GiB"
+disk: "50GiB"
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+mounts:
+  - location: "~/Developer/fc-live-migration"
+    writable: true
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y docker.io docker-compose-v2 make curl jq
+      usermod -aG docker,kvm "{{.User}}" || true
