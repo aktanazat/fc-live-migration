@@ -174,6 +174,12 @@ type Config struct {
 	VMID       string
 	SourceURL  string
 	TargetURL  string
+	// PeerURL is the target hostd's base URL as reachable from the
+	// source *container* (the source pushes snapshot bytes and issues
+	// the cutover load host-to-host). The orchestrator-visible
+	// TargetURL is usually a published localhost port and is not
+	// dialable from inside the source container.
+	PeerURL    string
 	KernelPath string
 	RootfsPath string
 	KernelArgs string
@@ -217,6 +223,8 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: source url is required")
 	case c.TargetURL == "":
 		return fmt.Errorf("config: target url is required")
+	case c.PeerURL == "":
+		return fmt.Errorf("config: peer url is required")
 	case c.KernelPath == "":
 		return fmt.Errorf("config: kernel path is required")
 	case c.RootfsPath == "":
@@ -308,14 +316,11 @@ func Orchestrate(ctx context.Context, cfg Config) (*MigrationReport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("round 0 snapshot: %w", err)
 	}
-	fullPush, err := src.Push(ctx, cfg.VMID, api.PushRequest{
-		TargetURL: cfg.TargetURL,
-		RemoteDir: tgtBase,
+	fullPush, err := src.Push(ctx, cfg.VMID, api.PushRequest{TargetURL: cfg.PeerURL, RemoteDir: tgtBase,
 		Files: []api.PushFile{
 			{Path: full.MemPath, Name: "mem", Sparse: false},
 			{Path: full.StatePath, Name: "state", Sparse: false},
-		},
-	})
+		},})
 	if err != nil {
 		return nil, fmt.Errorf("round 0 push: %w", err)
 	}
@@ -344,13 +349,10 @@ func Orchestrate(ctx context.Context, cfg Config) (*MigrationReport, error) {
 		if diff.DataBytes <= cfg.ThresholdBytes {
 			break
 		}
-		diffPush, err := src.Push(ctx, cfg.VMID, api.PushRequest{
-			TargetURL: cfg.TargetURL,
-			RemoteDir: tgtBase,
+		diffPush, err := src.Push(ctx, cfg.VMID, api.PushRequest{TargetURL: cfg.PeerURL, RemoteDir: tgtBase,
 			Files: []api.PushFile{
 				{Path: diff.MemPath, Name: "mem", Sparse: true},
-			},
-		})
+			},})
 		if err != nil {
 			return nil, fmt.Errorf("round %d push: %w", round, err)
 		}
@@ -362,13 +364,10 @@ func Orchestrate(ctx context.Context, cfg Config) (*MigrationReport, error) {
 		})
 	}
 
-	cutover, err := src.Cutover(ctx, cfg.VMID, api.CutoverRequest{
-		TargetURL:     cfg.TargetURL,
-		TargetID:      cfg.VMID,
+	cutover, err := src.Cutover(ctx, cfg.VMID, api.CutoverRequest{TargetURL: cfg.PeerURL, TargetID:      cfg.VMID,
 		RemoteDir:     tgtBase,
 		RemoteMemName: "mem",
-		LocalDir:      srcBase + "/cutover",
-	})
+		LocalDir:      srcBase + "/cutover",})
 	if err != nil {
 		return nil, fmt.Errorf("cutover: %w", err)
 	}

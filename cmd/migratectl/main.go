@@ -22,6 +22,7 @@ const (
 	defaultVMID        = "vm0"
 	defaultSourceURL   = "http://127.0.0.1:8081"
 	defaultTargetURL   = "http://127.0.0.1:8082"
+	defaultPeerURL     = "http://172.30.0.12:8080"
 	defaultObserverURL = "http://127.0.0.1:9090"
 	defaultKernelPath  = "/artifacts/vmlinux"
 	defaultRootfsPath  = "/artifacts/rootfs.ext4"
@@ -112,6 +113,7 @@ func runMigrate(args []string) error {
 	fs := flag.NewFlagSet("migrate", flag.ExitOnError)
 	source := fs.String("source", defaultSourceURL, "source hostd base URL")
 	target := fs.String("target", defaultTargetURL, "target hostd base URL")
+	peer := fs.String("peer", defaultPeerURL, "target hostd base URL as reachable from the source container")
 	id := fs.String("vm", defaultVMID, "VM id")
 	kernel := fs.String("kernel", defaultKernelPath, "kernel image path (container-local)")
 	rootfs := fs.String("rootfs", defaultRootfsPath, "rootfs image path (container-local)")
@@ -145,6 +147,7 @@ func runMigrate(args []string) error {
 		VMID:           *id,
 		SourceURL:      *source,
 		TargetURL:      *target,
+		PeerURL:        *peer,
 		KernelPath:     *kernel,
 		RootfsPath:     *rootfs,
 		KernelArgs:     *kernelArgs,
