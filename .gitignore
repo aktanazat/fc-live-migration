@@ -8,3 +8,5 @@ media/*.m4a
 media/*.mov
 media/TRANSCRIPT.md
 media/final*.mp4
+media/prompter/
+media/captions.srt
