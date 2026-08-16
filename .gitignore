@@ -3,3 +3,8 @@ bin/
 *.ext4
 vmlinux
 .DS_Store
+media/*.mp4
+media/*.m4a
+media/*.mov
+media/TRANSCRIPT.md
+media/final*.mp4
