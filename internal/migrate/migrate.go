@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,6 +31,11 @@ type Client struct {
 func NewClient(baseURL string) *Client {
 	return &Client{baseURL: strings.TrimRight(baseURL, "/"), hc: &http.Client{}}
 }
+
+// ErrNotFound wraps every 404 from hostd, so callers can distinguish
+// "this VM does not exist on that host" (a normal state after a
+// migration) from a real failure.
+var ErrNotFound = errors.New("not found")
 
 // httpJSON issues method against fullURL, marshaling body (if non-nil)
 // as the JSON request payload and decoding a 2xx response into out
@@ -59,11 +65,17 @@ func httpJSON(ctx context.Context, hc *http.Client, method, fullURL string, body
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(resp.Body)
+		var base error
 		var apiErr api.Error
 		if err := json.Unmarshal(data, &apiErr); err == nil && apiErr.Error != "" {
-			return fmt.Errorf("%s %s: %s (status %d)", method, fullURL, apiErr.Error, resp.StatusCode)
+			base = fmt.Errorf("%s %s: %s (status %d)", method, fullURL, apiErr.Error, resp.StatusCode)
+		} else {
+			base = fmt.Errorf("%s %s: unexpected status %d: %s", method, fullURL, resp.StatusCode, string(data))
 		}
-		return fmt.Errorf("%s %s: unexpected status %d: %s", method, fullURL, resp.StatusCode, string(data))
+		if resp.StatusCode == http.StatusNotFound {
+			return fmt.Errorf("%w: %w", ErrNotFound, base)
+		}
+		return base
 	}
 	if out != nil {
 		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
@@ -317,6 +329,8 @@ func Orchestrate(ctx context.Context, cfg Config) (*MigrationReport, error) {
 		// Migrate the existing guest.
 	case err == nil:
 		return nil, fmt.Errorf("vm %s on source %s is %s, not running", cfg.VMID, cfg.SourceURL, info.State)
+	case !errors.Is(err, ErrNotFound):
+		return nil, fmt.Errorf("query %s on source %s: %w", cfg.VMID, cfg.SourceURL, err)
 	default:
 		if info, err = src.CreateVM(ctx, api.CreateVMRequest{
 			ID:              cfg.VMID,

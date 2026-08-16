@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -269,16 +270,20 @@ func runStatus(args []string) error {
 	tgtInfo, tgtErr := migrate.NewClient(*target).GetVM(ctx, *id)
 
 	print := func(label, url string, info api.VMInfo, err error) {
-		if err != nil {
+		switch {
+		case err == nil:
+			fmt.Printf("%-6s %-24s id=%s state=%-9s pid=%d\n", label, url, info.ID, info.State, info.PID)
+		case errors.Is(err, migrate.ErrNotFound):
+			fmt.Printf("%-6s %-24s no %s here\n", label, url, *id)
+		default:
 			fmt.Printf("%-6s %-24s error: %v\n", label, url, err)
-			return
 		}
-		fmt.Printf("%-6s %-24s id=%s state=%-9s pid=%d\n", label, url, info.ID, info.State, info.PID)
 	}
 	print("source", *source, srcInfo, srcErr)
 	print("target", *target, tgtInfo, tgtErr)
 
-	if srcErr != nil || tgtErr != nil {
+	notFound := func(err error) bool { return err == nil || errors.Is(err, migrate.ErrNotFound) }
+	if !notFound(srcErr) || !notFound(tgtErr) {
 		return fmt.Errorf("status query failed on at least one host")
 	}
 	return nil
