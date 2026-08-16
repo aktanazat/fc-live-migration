@@ -169,6 +169,13 @@ func (c *Client) Cutover(ctx context.Context, id string, req api.CutoverRequest)
 	return out, err
 }
 
+// SetCheckpointer suspends (false) or resumes (true) the VM's
+// background checkpointer on its host.
+func (c *Client) SetCheckpointer(ctx context.Context, id string, enabled bool) error {
+	var out api.CheckpointerResponse
+	return c.do(ctx, http.MethodPost, vmPath(id, "checkpointer"), api.CheckpointerRequest{Enabled: enabled}, &out)
+}
+
 // Config parameterizes one end-to-end migration run.
 type Config struct {
 	VMID      string
@@ -338,8 +345,47 @@ func Orchestrate(ctx context.Context, cfg Config) (*MigrationReport, error) {
 		}
 	}
 
+	// Suspend the source's background checkpointer for the duration
+	// of the migration: a background diff taken after the base sync
+	// would fold pages into the source's base that the target never
+	// receives. Re-enabled on any failure; on success the source VM
+	// is deleted anyway.
+	if err := src.SetCheckpointer(ctx, cfg.VMID, false); err != nil {
+		return nil, fmt.Errorf("suspend checkpointer: %w", err)
+	}
+	migrated := false
+	defer func() {
+		if !migrated {
+			// Best-effort: the guest keeps running on the source, so
+			// its checkpointer must keep running too.
+			_ = src.SetCheckpointer(context.Background(), cfg.VMID, true)
+		}
+	}()
+
 	srcBase := "/snapshots/" + cfg.VMID
 	tgtBase := srcBase + "/base"
+
+	// Checkpoint refresh (round 0): fold everything the guest has
+	// dirtied since its standing base — for a young VM, the tail of
+	// kernel boot — into the local base before shipping it. hostd
+	// merges every diff snapshot into the base, so this is a plain
+	// snapshot whose files are never pushed; the pages travel inside
+	// the base sync instead of inflating the first pushed diff round.
+	// Its pause is guest-frozen time and is counted in
+	// TotalBlackoutMs like any other round.
+	ckpt, err := src.Snapshot(ctx, cfg.VMID, api.SnapshotRequest{
+		Type:   api.SnapshotDiff,
+		Dir:    srcBase + "/ckpt",
+		Resume: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("checkpoint refresh: %w", err)
+	}
+	report.Rounds = append(report.Rounds, RoundReport{
+		Round:     0,
+		DataBytes: ckpt.DataBytes,
+		SnapMs:    snapshotWallMs(ckpt),
+	})
 
 	// Base sync: ship the source's standing base checkpoint (guest
 	// memory as of its last snapshot or load) to the target. The
@@ -400,6 +446,7 @@ func Orchestrate(ctx context.Context, cfg Config) (*MigrationReport, error) {
 		return nil, fmt.Errorf("cutover: %w", err)
 	}
 	report.Cutover = cutover
+	migrated = true
 
 	if err := src.DeleteVM(ctx, cfg.VMID); err != nil {
 		return nil, fmt.Errorf("delete source vm %s: %w", cfg.VMID, err)

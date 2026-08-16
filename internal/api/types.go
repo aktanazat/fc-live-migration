@@ -14,6 +14,7 @@
 //	POST   /vms/{id}/push              PushRequest      → PushResponse (stream files to a peer hostd)
 //	POST   /vms/{id}/load              LoadRequest      → OpTiming     (snapshot/load into a prepared VM)
 //	POST   /vms/{id}/cutover           CutoverRequest   → CutoverResponse (source-side final phase)
+//	POST   /vms/{id}/checkpointer      CheckpointerRequest → CheckpointerResponse (suspend/resume background checkpointing)
 //	POST   /files/base?dir=&name=      octet-stream     → FileWriteResponse (receive a whole file)
 //	POST   /files/extents?dir=&name=&size=  extent stream → FileWriteResponse (apply sparse extents in place)
 //
@@ -183,4 +184,17 @@ type FileWriteResponse struct {
 // Error is the JSON body of every non-2xx hostd response.
 type Error struct {
 	Error string `json:"error"`
+}
+
+// CheckpointerRequest suspends (Enabled=false) or resumes
+// (Enabled=true) a VM's background checkpointer. A migration must
+// suspend it: a background diff taken after the base sync would fold
+// pages into the source's base that the target never receives.
+type CheckpointerRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+// CheckpointerResponse echoes the resulting checkpointer state.
+type CheckpointerResponse struct {
+	Enabled bool `json:"enabled"`
 }

@@ -30,6 +30,7 @@ func run() error {
 	fcBin := flag.String("fc-bin", "/usr/local/bin/firecracker", "path to the firecracker binary")
 	snapshotsDir := flag.String("snapshots-dir", "/snapshots", "root directory for VM snapshot artifacts")
 	runDir := flag.String("run-dir", "/run/fc", "directory for firecracker API sockets and logs")
+	ckptInterval := flag.Duration("checkpoint-interval", 3*time.Second, "background base-checkpoint interval; 0 disables")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -42,10 +43,11 @@ func run() error {
 	}
 
 	srv := hostd.NewServer(hostd.Config{
-		FCBin:        *fcBin,
-		SnapshotsDir: *snapshotsDir,
-		RunDir:       *runDir,
-		Logger:       logger,
+		FCBin:              *fcBin,
+		SnapshotsDir:       *snapshotsDir,
+		RunDir:             *runDir,
+		CheckpointInterval: *ckptInterval,
+		Logger:             logger,
 	})
 
 	httpServer := &http.Server{

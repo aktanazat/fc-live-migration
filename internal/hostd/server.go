@@ -31,7 +31,8 @@ type Server struct {
 	// window.
 	peerClient *http.Client
 
-	reg *registry
+	ckptInterval time.Duration
+	reg          *registry
 }
 
 // Config are the knobs cmd/hostd exposes as flags.
@@ -40,6 +41,10 @@ type Config struct {
 	SnapshotsDir string
 	RunDir       string
 	Logger       *slog.Logger
+	// CheckpointInterval is how often the background checkpointer
+	// folds each running VM's dirty pages into its base file. Zero
+	// disables background checkpointing.
+	CheckpointInterval time.Duration
 }
 
 // NewServer builds a Server ready to serve Routes().
@@ -49,6 +54,7 @@ func NewServer(cfg Config) *Server {
 		snapshotsDir: cfg.SnapshotsDir,
 		runDir:       cfg.RunDir,
 		logger:       cfg.Logger,
+		ckptInterval: cfg.CheckpointInterval,
 		peerClient: &http.Client{
 			Transport: &http.Transport{
 				MaxIdleConnsPerHost: 4,
@@ -76,6 +82,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /vms/{id}/cutover", s.handleCutover)
 	mux.HandleFunc("POST /files/base", s.handleFilesBase)
 	mux.HandleFunc("POST /files/extents", s.handleFilesExtents)
+	mux.HandleFunc("POST /vms/{id}/checkpointer", s.handleCheckpointer)
 	return mux
 }
 
@@ -83,6 +90,7 @@ func (s *Server) Routes() http.Handler {
 // graceful shutdown.
 func (s *Server) KillAll() {
 	for _, vm := range s.reg.list() {
+		stopCheckpointer(vm)
 		if err := vm.FC.Kill(); err != nil {
 			s.logger.Error("kill vm on shutdown", "vm", vm.ID, "err", err)
 		}

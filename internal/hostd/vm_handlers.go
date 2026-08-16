@@ -82,6 +82,7 @@ func (s *Server) handleCreateVM(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	s.startCheckpointer(vm)
 	writeJSON(w, http.StatusCreated, vm.Info())
 }
 
@@ -193,6 +194,7 @@ func (s *Server) handleDeleteVM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, fmt.Errorf("vm %s not found", id))
 		return
 	}
+	stopCheckpointer(vm)
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
 	if err := vm.FC.Kill(); err != nil {
@@ -291,43 +293,66 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
 
+	resp, status, err := s.doSnapshot(vm, snapType, req.Dir, req.Resume)
+	if err != nil {
+		writeError(w, status, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// doSnapshot is the snapshot core shared by the REST handler and the
+// background checkpointer: pause if running, write the snapshot,
+// resume if requested, and fold diff snapshots into the VM's base
+// checkpoint. The caller holds vm.mu. The returned status is the
+// HTTP code matching err.
+func (s *Server) doSnapshot(vm *VM, snapType fc.SnapshotType, dir string, resume bool) (api.SnapshotResponse, int, error) {
+	var zero api.SnapshotResponse
+
 	var pauseMs float64
 	switch vm.State {
 	case api.StateRunning:
 		pauseStart := time.Now()
 		if err := vm.FC.Pause(); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("pause: %w", err))
-			return
+			return zero, http.StatusInternalServerError, fmt.Errorf("pause: %w", err)
 		}
 		pauseMs = msSince(pauseStart)
 		vm.State = api.StatePaused
 	case api.StatePaused:
 		// Already paused; nothing to do.
 	default:
-		writeError(w, http.StatusConflict, fmt.Errorf("vm %s is %s, cannot snapshot", id, vm.State))
-		return
+		return zero, http.StatusConflict, fmt.Errorf("vm %s is %s, cannot snapshot", vm.ID, vm.State)
 	}
 
-	if err := os.MkdirAll(req.Dir, 0o755); err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("mkdir %s: %w", req.Dir, err))
-		return
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return zero, http.StatusInternalServerError, fmt.Errorf("mkdir %s: %w", dir, err)
 	}
-	statePath := filepath.Join(req.Dir, snapshotStateName)
-	memPath := filepath.Join(req.Dir, snapshotMemName)
+	statePath := filepath.Join(dir, snapshotStateName)
+	memPath := filepath.Join(dir, snapshotMemName)
+
+	// Snapshot dirs are reused (the checkpointer ticks into one dir;
+	// migrations reuse round dirs), and Firecracker writes into an
+	// existing mem file without truncating it. Stale extents from a
+	// prior snapshot would then inflate DataBytes and every extent
+	// walk, so start from empty files.
+	if err := os.Remove(memPath); err != nil && !os.IsNotExist(err) {
+		return zero, http.StatusInternalServerError, fmt.Errorf("remove stale %s: %w", memPath, err)
+	}
+	if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
+		return zero, http.StatusInternalServerError, fmt.Errorf("remove stale %s: %w", statePath, err)
+	}
 
 	snapStart := time.Now()
 	if err := vm.FC.CreateSnapshot(snapType, statePath, memPath); err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("create snapshot: %w", err))
-		return
+		return zero, http.StatusInternalServerError, fmt.Errorf("create snapshot: %w", err)
 	}
 	snapMs := msSince(snapStart)
 
 	var resumeMs float64
-	if req.Resume {
+	if resume {
 		resumeStart := time.Now()
 		if err := vm.FC.Resume(); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("resume: %w", err))
-			return
+			return zero, http.StatusInternalServerError, fmt.Errorf("resume: %w", err)
 		}
 		resumeMs = msSince(resumeStart)
 		vm.State = api.StateRunning
@@ -341,27 +366,23 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	// there directly).
 	if snapType == fc.SnapshotDiff && vm.BaseMemPath != "" && memPath != vm.BaseMemPath {
 		if _, _, err := sparse.Merge(vm.BaseMemPath, memPath); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("merge diff into base: %w", err))
-			return
+			return zero, http.StatusInternalServerError, fmt.Errorf("merge diff into base: %w", err)
 		}
 		if err := copyFile(vm.BaseStatePath, statePath); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("refresh base vmstate: %w", err))
-			return
+			return zero, http.StatusInternalServerError, fmt.Errorf("refresh base vmstate: %w", err)
 		}
 	}
 
 	memInfo, err := os.Stat(memPath)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("stat %s: %w", memPath, err))
-		return
+		return zero, http.StatusInternalServerError, fmt.Errorf("stat %s: %w", memPath, err)
 	}
 	dataBytes, err := sparse.AllocatedBytes(memPath)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return zero, http.StatusInternalServerError, err
 	}
 
-	writeJSON(w, http.StatusOK, api.SnapshotResponse{
+	return api.SnapshotResponse{
 		StatePath: statePath,
 		MemPath:   memPath,
 		MemBytes:  memInfo.Size(),
@@ -369,7 +390,7 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		PauseMs:   pauseMs,
 		SnapMs:    snapMs,
 		ResumeMs:  resumeMs,
-	})
+	}, http.StatusOK, nil
 }
 
 func toFCSnapshotType(t api.SnapshotType) (fc.SnapshotType, error) {
@@ -423,5 +444,6 @@ func (s *Server) handleLoad(w http.ResponseWriter, r *http.Request) {
 	} else {
 		vm.State = api.StatePaused
 	}
+	s.startCheckpointer(vm)
 	writeJSON(w, http.StatusOK, api.OpTiming{Ms: ms})
 }

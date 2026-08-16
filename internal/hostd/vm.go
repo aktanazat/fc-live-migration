@@ -31,6 +31,12 @@ type VM struct {
 	// page tracking disabled).
 	BaseMemPath   string
 	BaseStatePath string
+
+	// CkptSuspended pauses the background checkpointer while a
+	// migration is in flight (guarded by mu). ckptStop ends the
+	// checkpoint loop when the VM goes away.
+	CkptSuspended bool
+	ckptStop      chan struct{}
 }
 
 // Info snapshots the VM's current identity fields into the wire

@@ -68,7 +68,11 @@ curl -fsS -X POST "$OBSERVER/reset" >/dev/null
 echo "$SMOKE_ID torn down, observer reset for the real run"
 
 step 3 "migrating vm0 host-a -> host-b (migrate boots, pre-copies, cuts over)"
-migrate_out="$("$MIGRATECTL" migrate --source "$HOSTD_A" --target "$HOSTD_B" 2>&1 | tee /dev/stderr)"
+# --settle-packets 2000 keeps the guest running ~4s before the measured
+# window so the background checkpointer's first tick absorbs kernel-boot
+# dirt into the base; the migration itself then moves only steady-state
+# dirt.
+migrate_out="$("$MIGRATECTL" migrate --source "$HOSTD_A" --target "$HOSTD_B" --settle-packets 2000 2>&1 | tee /dev/stderr)"
 
 result_line="$(printf '%s\n' "$migrate_out" | grep '^RESULT ' | tail -n1)"
 if [[ -z "$result_line" ]]; then
