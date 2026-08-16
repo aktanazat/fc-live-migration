@@ -10,3 +10,6 @@ media/TRANSCRIPT.md
 media/final*.mp4
 media/prompter/
 media/captions.srt
+/migratectl
+/hostd
+/observer
