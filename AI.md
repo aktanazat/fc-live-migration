@@ -52,8 +52,8 @@ first, then wire hashing, not the reverse) and signed off on the fix,
 which the agent implemented: the pre-copy loop's convergence check
 now runs only after a diff's push succeeds, and cutover's failure
 path folds the final diff into the local base before returning an
-error. See the README's Pitfalls section for the user-facing version
-of this.
+error. See the Pitfalls section of `docs/design.md` for the
+user-facing version of this.
 
 ## What the human did
 

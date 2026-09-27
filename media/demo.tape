@@ -1,4 +1,4 @@
-# VHS tape for the Dedalus submission video.
+# VHS tape for the demo video.
 # Renders a deterministic, narration-paced terminal recording of the
 # live-migration demo. Regenerate with:
 #   agent-capture-pp-cli vhs media/demo.tape media/demo.mp4
